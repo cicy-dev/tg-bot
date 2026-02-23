@@ -46,6 +46,9 @@ MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "tts_bot")
 SUPERVISOR_CONF_DIR = os.getenv("SUPERVISOR_CONF_DIR", "/etc/supervisor/conf.d")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
 SUPERVISOR_CONF_TEMPLATE = """[program:{{ program_name }}]
 command={{ script_path }} {{ pane_id }}
 directory={{ workspace }}
@@ -53,9 +56,9 @@ environment=PATH="/usr/local/bin:/usr/bin:/bin",PYTHONPATH="/usr/lib/python3/dis
 autostart=true
 autorestart=true
 startretries=3
-stderr_logfile=/var/log/supervisor/{{ program_name }}.err.log
-stdout_logfile=/var/log/supervisor/{{ program_name }}.out.log
-user=root
+stderr_logfile={{ log_dir }}/{{ program_name }}.err.log
+stdout_logfile={{ log_dir }}/{{ program_name }}.out.log
+user=w3c_offical
 """
 
 
@@ -112,9 +115,10 @@ def write_supervisor_conf(program_name: str, pane_id: str, workspace: str):
     
     conf_content = Template(SUPERVISOR_CONF_TEMPLATE).render(
         program_name=program_name,
-        script_path=f"/usr/bin/python3 {script_path}",
+        script_path=f"/usr/bin/python3 -u {script_path}",
         pane_id=pane_id,
-        workspace=workspace or os.path.expanduser("~")
+        workspace=workspace or os.path.expanduser("~"),
+        log_dir=LOG_DIR
     )
     
     conf_path = Path(SUPERVISOR_CONF_DIR) / f"{program_name}.conf"
@@ -223,7 +227,7 @@ def sync_bots():
 
 
 def main():
-    print("TG Bot Supervisor Manager started")
+    logger.info("TG Bot Supervisor Manager started")
     interval = 10
     
     while True:

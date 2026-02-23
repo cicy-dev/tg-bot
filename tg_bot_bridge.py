@@ -187,6 +187,20 @@ def send_to_tmux(text: str, send_enter: bool = False):
     return True
 
 
+def capture_tmux_output(max_lines=50) -> str:
+    """Capture current tmux pane content."""
+    target = PANE_ID
+    if target.endswith(".0"):
+        target = target[:-2]
+    result = subprocess.run(
+        ["tmux", "-S", TMUX_SOCKET, "capture-pane", "-t", shlex.quote(target), "-p", "-S", f"-{max_lines}"],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        return result.stdout.rstrip()
+    return ""
+
+
 def check_tmux_pane_exists() -> bool:
     """Check if tmux pane exists."""
     session_part = PANE_ID.split(":")[0]
@@ -305,7 +319,15 @@ def main():
                     print(f"Typing and executing: {cmd}")
                 
                 if send_to_tmux(cmd, send_enter=True):
-                    send_telegram_message(f"🚀 Sent to {PANE_ID}")
+                    time.sleep(1.5)
+                    output = capture_tmux_output()
+                    if output:
+                        # Telegram message limit is 4096 chars
+                        if len(output) > 4000:
+                            output = output[-4000:]
+                        send_telegram_message(f"📟 {PANE_ID}\n{output}")
+                    else:
+                        send_telegram_message(f"🚀 Sent to {PANE_ID}")
                 else:
                     send_telegram_message(f"发送失败: {cmd}")
             
