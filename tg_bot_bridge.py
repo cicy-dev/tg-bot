@@ -35,7 +35,7 @@ TMUX_SOCKET = os.getenv("TMUX_SOCKET", "/home/w3c_offical/.tmux/default")
 
 LLM_PROXY_HOST = os.getenv("LLM_PROXY_HOST", "127.0.0.1")
 LLM_PROXY_PORT = os.getenv("LLM_PROXY_PORT", "18080")
-LLM_PROXY_ENABLED = os.getenv("LLM_PROXY_ENABLED", "false").lower() == "true"
+LLM_PROXY_ENABLED = False
 
 CA_BUNDLE_PATH = "/home/w3c_offical/.mitmproxy/mitmproxy-ca-cert.pem"
 
@@ -48,6 +48,8 @@ TG_CHAT_ID = ''
 PROXY = None
 STT_ENGINE = "google"
 TTS_REPLY = False
+PRIVATE_MODE = False
+ALLOWED_USERS = []
 
 
 def get_db():
@@ -63,7 +65,7 @@ def get_db():
 
 def load_config():
     """Load bot configuration from database."""
-    global API_TOKEN, TG_CHAT_ID, PROXY
+    global API_TOKEN, TG_CHAT_ID, PROXY, PRIVATE_MODE, ALLOWED_USERS, LLM_PROXY_ENABLED
     
     if not PANE_ID:
         print("Error: PANE_ID not set")
@@ -73,7 +75,7 @@ def load_config():
     try:
         with conn.cursor() as c:
             c.execute("""
-                SELECT tg_token, tg_chat_id, proxy, tg_enable
+                SELECT tg_token, tg_chat_id, proxy, tg_enable, private_mode, allowed_users, llm_proxy
                 FROM ttyd_config
                 WHERE pane_id = %s
             """, (PANE_ID,))
@@ -90,6 +92,10 @@ def load_config():
             API_TOKEN = str(row.get('tg_token') or '')
             TG_CHAT_ID = str(row.get('tg_chat_id') or '') if row.get('tg_chat_id') else ''
             PROXY = row.get('proxy')
+            PRIVATE_MODE = bool(row.get('private_mode'))
+            raw_users = row.get('allowed_users') or ''
+            ALLOWED_USERS = [u.strip() for u in raw_users.split(',') if u.strip()]
+            LLM_PROXY_ENABLED = bool(row.get('llm_proxy'))
             
             if not API_TOKEN:
                 print(f"Error: tg_token not configured")
@@ -194,12 +200,13 @@ def send_to_tmux(text: str, send_enter: bool = False):
     
     pane_id_safe = shlex.quote(target)
     
-    env_vars = {
-        "HTTP_PROXY": "http://127.0.0.1:18080",
-        "HTTPS_PROXY": "http://127.0.0.1:18080",
-        "REQUESTS_CA_BUNDLE": "/home/w3c_offical/.mitmproxy/mitmproxy-ca-cert.pem",
-        "X_PANE_ID": PANE_ID,
-    }
+    env_vars = {"X_PANE_ID": PANE_ID}
+    if LLM_PROXY_ENABLED:
+        env_vars.update({
+            "HTTP_PROXY": f"http://127.0.0.1:{LLM_PROXY_PORT}",
+            "HTTPS_PROXY": f"http://127.0.0.1:{LLM_PROXY_PORT}",
+            "REQUESTS_CA_BUNDLE": "/home/w3c_offical/.mitmproxy/mitmproxy-ca-cert.pem",
+        })
     
     for key, val in env_vars.items():
         subprocess.run(
@@ -211,12 +218,21 @@ def send_to_tmux(text: str, send_enter: bool = False):
     
     if send_enter:
         cmd.extend([text, "Enter"])
+        # Send text first, then Enter after a small delay
+        cmd_text = ["tmux", "-S", TMUX_SOCKET, "send-keys", "-t", pane_id_safe, "-l", text]
+        print(f"TMUX cmd: {' '.join(cmd_text)} + Enter")
+        result = subprocess.run(cmd_text, capture_output=True, text=True)
+        if result.returncode != 0:
+            error = result.stderr.strip()
+            print(f"TMUX error: {error}")
+            send_telegram_message(f"TMUX error: {error}")
+            return False
+        time.sleep(0.3)
+        result = subprocess.run(["tmux", "-S", TMUX_SOCKET, "send-keys", "-t", pane_id_safe, "Enter"], capture_output=True, text=True)
     else:
         cmd.append(text)
-    
-    print(f"TMUX cmd: {' '.join(cmd)}")
-    
-    result = subprocess.run(cmd, capture_output=True, text=True)
+        print(f"TMUX cmd: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         error = result.stderr.strip()
         print(f"TMUX error: {error}")
@@ -252,6 +268,84 @@ def handle_bot_command(text: str) -> str | None:
     h = fastapi_headers()
 
     try:
+        if cmd == "/ft":
+            try:
+                r1 = subprocess.run(["/home/w3c_offical/.local/bin/ft", "server-status"], capture_output=True, text=True, timeout=10)
+                r2 = subprocess.run(["/home/w3c_offical/.local/bin/ft", "client-status"], capture_output=True, text=True, timeout=10)
+                msg = (r1.stdout.strip() + "\n\n" + r2.stdout.strip()).strip() or "No output"
+            except Exception as e:
+                msg = f"❌ {e}"
+            send_telegram_message(msg)
+            return ""
+
+        if cmd == "/ls":
+            page = int(args[0]) if args else 0
+            PAGE_SIZE = 6
+            conn = get_db()
+            with conn.cursor() as c:
+                c.execute("SELECT pane_id, title, tg_enable FROM ttyd_config WHERE active = 1 ORDER BY pane_id")
+                rows = c.fetchall()
+            conn.close()
+            total = len(rows)
+            start = page * PAGE_SIZE
+            page_rows = rows[start:start + PAGE_SIZE]
+            buttons = []
+            for r in page_rows:
+                label = f"{'🟢' if r['tg_enable'] else '⚪'} {r['title'] or r['pane_id']}"
+                buttons.append([{"text": label, "callback_data": f"ls_{r['pane_id']}"}])
+            nav = []
+            if page > 0:
+                nav.append({"text": "⬅️ 上一页", "callback_data": f"ls_page_{page-1}"})
+            if start + PAGE_SIZE < total:
+                nav.append({"text": "➡️ 下一页", "callback_data": f"ls_page_{page+1}"})
+            if nav:
+                buttons.append(nav)
+            session.post(f"https://api.telegram.org/bot{API_TOKEN}/sendMessage", json={
+                "chat_id": TG_CHAT_ID,
+                "text": f"📋 Active Panes ({total})",
+                "reply_markup": {"inline_keyboard": buttons},
+            }, timeout=10)
+            return ""
+
+        if cmd == "/cf":
+            page = int(args[0]) if args else 0
+            PAGE_SIZE = 5
+            try:
+                cf_env = os.environ.copy()
+                result = subprocess.run(["python3", "/home/w3c_offical/skills/cf-tunnel.py", "list"], capture_output=True, text=True, timeout=15, env=cf_env)
+                print(f"CF stdout: {result.stdout[:200]}")
+                print(f"CF stderr: {result.stderr[:200]}")
+                lines = [l.strip() for l in result.stdout.strip().split('\n') if '→' in l and 'catch-all' not in l]
+                routes = []
+                for l in lines:
+                    parts_r = l.split('→')
+                    if len(parts_r) == 2:
+                        host = parts_r[0].strip().rstrip()
+                        status = '✅' if '✅' in l else '❌'
+                        routes.append((host, status))
+            except Exception as ex:
+                print(f"CF error: {ex}")
+                routes = []
+            total = len(routes)
+            start = page * PAGE_SIZE
+            page_routes = routes[start:start + PAGE_SIZE]
+            buttons = []
+            for host, status in page_routes:
+                buttons.append([{"text": f"{status} {host}", "callback_data": f"cf_{host}"}])
+            nav = []
+            if page > 0:
+                nav.append({"text": "⬅️", "callback_data": f"cf_page_{page-1}"})
+            if start + PAGE_SIZE < total:
+                nav.append({"text": "➡️", "callback_data": f"cf_page_{page+1}"})
+            if nav:
+                buttons.append(nav)
+            session.post(f"https://api.telegram.org/bot{API_TOKEN}/sendMessage", json={
+                "chat_id": TG_CHAT_ID,
+                "text": f"🌐 CF Routes ({total})",
+                "reply_markup": {"inline_keyboard": buttons},
+            }, timeout=10)
+            return ""
+
         if cmd == "/kb":
             kb = [
                 [{"text": "✅ y", "callback_data": "kb_y"}, {"text": "❌ n", "callback_data": "kb_n"}, {"text": "📌 t", "callback_data": "kb_t"}, {"text": "⏎ Enter", "callback_data": "kb_enter"}],
@@ -270,11 +364,11 @@ def handle_bot_command(text: str) -> str | None:
             text = (
                 f"👋 TG Bot Bridge\n"
                 f"📟 Pane: {PANE_ID}\n\n"
-                f"📋 命令:\n"
-                f"/kb - 虚拟键盘\n"
-                f"/admin - 管理面板\n"
                 f"直接发文字 = 发到 tmux"
             )
+            inline = [
+                [{"text": "⚙️ Admin", "callback_data": "menu_admin"}, {"text": "⌨️ 键盘", "callback_data": "menu_kb"}],
+            ]
             session.post(f"https://api.telegram.org/bot{API_TOKEN}/sendMessage", json={
                 "chat_id": TG_CHAT_ID,
                 "text": text,
@@ -297,10 +391,25 @@ def handle_bot_command(text: str) -> str | None:
                 conn.close()
             except Exception:
                 pass
+            # Get public IP and domain
+            try:
+                pub_ip = requests.get("https://ifconfig.me", timeout=5).text.strip()
+            except:
+                pub_ip = "unknown"
+            domain = "gcp-hk-1001.cicy.de5.net"
+            try:
+                import socket
+                resolved = socket.gethostbyname(domain)
+                domain_status = f"✅ {domain} → {resolved}" if resolved == pub_ip else f"⚠️ {domain} → {resolved} (mismatch)"
+            except:
+                domain_status = f"❌ {domain} (resolve failed)"
             lines = [
                 f"⚙️ Admin Panel",
                 f"📟 pane_id: {PANE_ID}",
                 f"💬 chat_id: {TG_CHAT_ID}",
+                f"🌐 IP: {pub_ip}",
+                f"🏷 Domain: {domain}",
+                f"🔗 {domain_status}",
                 f"🔗 proxy: {PROXY or 'none'}",
                 f"🔀 llm_proxy: {'on' if LLM_PROXY_ENABLED else 'off'}",
             ]
@@ -314,6 +423,9 @@ def handle_bot_command(text: str) -> str | None:
             inline_buttons.append([{"text": f"🎙 STT: {STT_ENGINE} → {other}", "callback_data": f"stt_{other}"}])
             tts_status = "🔊 ON" if TTS_REPLY else "🔇 OFF"
             inline_buttons.append([{"text": f"🗣 语音回复: {tts_status}", "callback_data": "toggle_tts"}])
+            inline_buttons.append([{"text": "📋 Panes", "callback_data": "menu_ls"}, {"text": "🌐 CF Routes", "callback_data": "menu_cf"}])
+            inline_buttons.append([{"text": "🚀 FT Status", "callback_data": "menu_ft"}])
+            inline_buttons.append([{"text": "🔄 更新DNS→当前IP", "callback_data": "update_dns"}])
             session.post(f"https://api.telegram.org/bot{API_TOKEN}/sendMessage", json={
                 "chat_id": TG_CHAT_ID,
                 "text": text_msg,
@@ -421,7 +533,47 @@ def main():
                             cb_data = cb.get("data", "")
                             cb_id = cb.get("id")
                             print(f"Callback: {cb_data}")
-                            if cb_data.startswith("stt_"):
+                            if cb_data == "update_dns":
+                                session.post(f"https://api.telegram.org/bot{API_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": "⏳ 检查中..."}, timeout=5)
+                                try:
+                                    import socket
+                                    pub_ip = requests.get("https://ifconfig.me", timeout=5).text.strip()
+                                    domain = "gcp-hk-1001.cicy.de5.net"
+                                    try:
+                                        resolved = socket.gethostbyname(domain)
+                                    except:
+                                        resolved = ""
+                                    if resolved == pub_ip:
+                                        send_telegram_message(f"✅ {domain} 已指向 {pub_ip}，无需更新")
+                                    else:
+                                        zone_id = "70b43be80d3f763069a08457d7794e43"
+                                        cf_token = os.environ.get("CLOUDFLARE_API_TOKEN_TUNNEL", "")
+                                        cf_headers = {"Authorization": f"Bearer {cf_token}", "Content-Type": "application/json"}
+                                        r = requests.get(f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records?name={domain}", headers=cf_headers, timeout=10)
+                                        records = r.json().get("result", [])
+                                        if records:
+                                            rec_id = records[0]["id"]
+                                            requests.put(f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{rec_id}", headers=cf_headers, json={"type": "A", "name": domain, "content": pub_ip, "proxied": False, "ttl": 1}, timeout=10)
+                                        else:
+                                            requests.post(f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records", headers=cf_headers, json={"type": "A", "name": domain, "content": pub_ip, "proxied": False, "ttl": 1}, timeout=10)
+                                        send_telegram_message(f"✅ {domain} → {pub_ip} (已更新)")
+                                except Exception as e:
+                                    send_telegram_message(f"❌ DNS更新失败: {e}")
+                            elif cb_data == "copy_ip":
+                                try:
+                                    ip = requests.get("https://ifconfig.me", timeout=5).text.strip()
+                                except:
+                                    ip = "unknown"
+                                session.post(f"https://api.telegram.org/bot{API_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id}, timeout=5)
+                                send_telegram_message(f"`{ip}`", parse_mode="Markdown")
+                            elif cb_data == "copy_domain":
+                                session.post(f"https://api.telegram.org/bot{API_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id}, timeout=5)
+                                send_telegram_message(f"`gcp-hk-1001.cicy.de5.net`", parse_mode="Markdown")
+                            elif cb_data.startswith("menu_"):
+                                menu = cb_data[5:]
+                                session.post(f"https://api.telegram.org/bot{API_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id}, timeout=5)
+                                handle_bot_command(f"/{menu}")
+                            elif cb_data.startswith("stt_"):
                                 STT_ENGINE = cb_data[4:]
                                 session.post(f"https://api.telegram.org/bot{API_TOKEN}/answerCallbackQuery", json={
                                     "callback_query_id": cb_id, "text": f"🎙 STT → {STT_ENGINE}"
@@ -434,6 +586,40 @@ def main():
                                     "callback_query_id": cb_id, "text": f"🗣 语音回复: {status}"
                                 }, timeout=5)
                                 send_telegram_message(f"🗣 语音回复: {status}")
+                            elif cb_data.startswith("cf_page_"):
+                                page = int(cb_data[8:])
+                                session.post(f"https://api.telegram.org/bot{API_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id}, timeout=5)
+                                handle_bot_command(f"/cf {page}")
+                            elif cb_data.startswith("cf_"):
+                                host = cb_data[3:]
+                                session.post(f"https://api.telegram.org/bot{API_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": "⏳ Testing..."}, timeout=5)
+                                try:
+                                    r = requests.get(f"https://{host}/", timeout=10, verify=True)
+                                    code = r.status_code
+                                except Exception as ex:
+                                    code = f"ERR: {ex}"
+                                send_telegram_message(f"🌐 {host}\nHTTP: {code}")
+                            elif cb_data.startswith("ls_page_"):
+                                page = int(cb_data[8:])
+                                session.post(f"https://api.telegram.org/bot{API_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id}, timeout=5)
+                                handle_bot_command(f"/ls {page}")
+                            elif cb_data.startswith("ls_"):
+                                pane = cb_data[3:]
+                                try:
+                                    conn = get_db()
+                                    with conn.cursor() as c:
+                                        c.execute("SELECT url, title FROM ttyd_config WHERE pane_id = %s", (pane,))
+                                        row = c.fetchone()
+                                    conn.close()
+                                    url = row.get("url", "") if row else ""
+                                    title = row.get("title", pane) if row else pane
+                                    if url:
+                                        send_telegram_message(f"🖥 {title}\n{url}")
+                                    else:
+                                        send_telegram_message(f"📟 {pane} (no URL)")
+                                except:
+                                    send_telegram_message(f"📟 {pane}")
+                                session.post(f"https://api.telegram.org/bot{API_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id}, timeout=5)
                             elif cb_data.startswith("kb_"):
                                 KB_MAP = {
                                     "kb_y": "y", "kb_n": "n", "kb_t": "t", "kb_enter": "Enter", "kb_space": " ",
@@ -463,6 +649,12 @@ def main():
                         continue
                     
                     chat_id = str(chat.get("id"))
+                    user_id = str(message.get("from", {}).get("id", ""))
+                    
+                    # Permission check
+                    if PRIVATE_MODE and ALLOWED_USERS and user_id not in ALLOWED_USERS:
+                        print(f"Blocked user_id: {user_id}")
+                        continue
                     
                     is_bound = TG_CHAT_ID and TG_CHAT_ID != 'None' and TG_CHAT_ID != 'null'
                     
@@ -527,37 +719,22 @@ def main():
                     
                     print(f"Sending: {cmd}")
                     ensure_pane_alive()
-                    result = send_wait_tmux(cmd)
-                    
-                    if result.get("success"):
-                        answer = result.get("answer", "").strip()
-                        if answer:
-                            if len(answer) > 4000:
-                                answer = answer[-4000:]
-                            send_telegram_message(f"📟 {PANE_ID}\n{answer}")
-                            if TTS_REPLY and answer and len(answer) <= 20:
-                                send_tts_voice(answer)
-                        else:
-                            send_telegram_message(f"🚀 Sent to {PANE_ID} (no output)")
-                    else:
-                        # Fallback: direct tmux send, then capture reply
-                        send_to_tmux(cmd, send_enter=True)
-                        send_telegram_message(f"🚀 Sent to {PANE_ID}")
-                        print(f"TTS_REPLY={TTS_REPLY}")
-                        # Wait and capture response
+                    send_to_tmux(cmd, send_enter=True)
+                    send_telegram_message(f"🚀 {PANE_ID}")
+                    if TTS_REPLY:
                         time.sleep(8)
                         try:
                             h = fastapi_headers()
                             r = requests.post(f"{FASTAPI_BASE}/api/tmux/capture_pane", json={"pane_id": PANE_ID, "start": -5}, headers=h, timeout=10)
                             output = r.json().get("output", "").strip()
                             if output:
-                                lines = [l for l in output.split("\n") if l.strip() and not l.strip().startswith(("λ >", "> ", "55%", "Credits:"))]
+                                lines = [l for l in output.split("\n") if l.strip() and not l.strip().startswith(("λ >", "> ", "55%", "Credits:")) and cmd not in l]
                                 trimmed = "\n".join(lines[-3:]) if lines else ""
-                                if trimmed and trimmed != cmd:
+                                if trimmed:
                                     if len(trimmed) > 500:
                                         trimmed = trimmed[-500:]
                                     send_telegram_message(f"📟 {trimmed}")
-                                    if TTS_REPLY and len(trimmed) <= 20:
+                                    if len(trimmed) <= 20:
                                         send_tts_voice(trimmed)
                         except Exception as e:
                             print(f"Capture failed: {e}")
