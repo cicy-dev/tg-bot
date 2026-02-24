@@ -1,7 +1,7 @@
-2026-02-21 02:50:33,913 - INFO - [START] tg_bot_test_main.0 for pane test:main.0
-2026-02-21 02:51:21,825 - INFO - [START] tg_bot_test_main.0 for pane test:main.0
-2026-02-21 02:51:21,850 - INFO - [START] tg_bot_test1_main.0 for pane test1:main.0
-2026-02-21 02:55:24,351 - INFO - [START] tg_bot_test_main.0 for pane test:main.0
-2026-02-21 02:55:24,378 - INFO - [START] tg_bot_test1_main.0 for pane test1:main.0
-2026-02-21 02:56:13,843 - INFO - [START] tg_bot_test_main.0 for pane test:main.0
-2026-02-21 02:56:13,865 - INFO - [START] tg_bot_test1_main.0 for pane test1:main.0
+TG Bot Supervisor Manager started
+Traceback (most recent call last):
+  File "/home/w3c_offical/projects/ai-workers/tg-bot/supervisor_manager.py", line 239, in <module>
+    main()
+  File "/home/w3c_offical/projects/ai-workers/tg-bot/supervisor_manager.py", line 235, in main
+    time.sleep(interval)
+KeyboardInterrupt
