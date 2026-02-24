@@ -275,7 +275,23 @@ def handle_bot_command(text: str) -> str | None:
                 msg = (r1.stdout.strip() + "\n\n" + r2.stdout.strip()).strip() or "No output"
             except Exception as e:
                 msg = f"❌ {e}"
-            send_telegram_message(msg)
+            inline_buttons = [[{"text": "🔌 Test Telnet", "callback_data": "ft_telnet"}]]
+            session.post(f"https://api.telegram.org/bot{API_TOKEN}/sendMessage", json={
+                "chat_id": TG_CHAT_ID, "text": msg, "reply_markup": {"inline_keyboard": inline_buttons}
+            }, timeout=5)
+            return ""
+
+        if cmd == "/gcloud":
+            try:
+                r1 = subprocess.run(["sudo", "-u", "w3c_offical", "/snap/bin/gcloud", "compute", "instances", "list", "--project=spry-cosine-483915-j6"], capture_output=True, text=True, timeout=10)
+                r2 = subprocess.run(["sudo", "-u", "w3c_offical", "/snap/bin/gcloud", "compute", "firewall-rules", "list", "--project=spry-cosine-483915-j6"], capture_output=True, text=True, timeout=10)
+                msg = "📦 GCP Instances:\n" + (r1.stdout.strip() or "No instances") + "\n\n🔥 Firewall Rules:\n" + (r2.stdout.strip() or "No rules")
+            except Exception as e:
+                msg = f"❌ {e}"
+            inline_buttons = [[{"text": "🔄 Refresh", "callback_data": "menu_gcloud"}]]
+            session.post(f"https://api.telegram.org/bot{API_TOKEN}/sendMessage", json={
+                "chat_id": TG_CHAT_ID, "text": msg, "reply_markup": {"inline_keyboard": inline_buttons}
+            }, timeout=5)
             return ""
 
         if cmd == "/ls":
@@ -424,7 +440,7 @@ def handle_bot_command(text: str) -> str | None:
             tts_status = "🔊 ON" if TTS_REPLY else "🔇 OFF"
             inline_buttons.append([{"text": f"🗣 语音回复: {tts_status}", "callback_data": "toggle_tts"}])
             inline_buttons.append([{"text": "📋 Panes", "callback_data": "menu_ls"}, {"text": "🌐 CF Routes", "callback_data": "menu_cf"}])
-            inline_buttons.append([{"text": "🚀 FT Status", "callback_data": "menu_ft"}])
+            inline_buttons.append([{"text": "🚀 FT Status", "callback_data": "menu_ft"}, {"text": "☁️ GCloud", "callback_data": "menu_gcloud"}])
             inline_buttons.append([{"text": "🔄 更新DNS→当前IP", "callback_data": "update_dns"}])
             session.post(f"https://api.telegram.org/bot{API_TOKEN}/sendMessage", json={
                 "chat_id": TG_CHAT_ID,
@@ -533,7 +549,21 @@ def main():
                             cb_data = cb.get("data", "")
                             cb_id = cb.get("id")
                             print(f"Callback: {cb_data}")
-                            if cb_data == "update_dns":
+                            if cb_data == "ft_telnet":
+                                session.post(f"https://api.telegram.org/bot{API_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": "⏳ Testing..."}, timeout=5)
+                                try:
+                                    import socket
+                                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                                    sock.settimeout(5)
+                                    result = sock.connect_ex(("34.150.15.106", 7000))
+                                    sock.close()
+                                    if result == 0:
+                                        send_telegram_message("✅ Telnet 34.150.15.106:7000 OK")
+                                    else:
+                                        send_telegram_message(f"❌ Telnet 34.150.15.106:7000 Failed (errno {result})")
+                                except Exception as e:
+                                    send_telegram_message(f"❌ Telnet error: {e}")
+                            elif cb_data == "update_dns":
                                 session.post(f"https://api.telegram.org/bot{API_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": "⏳ 检查中..."}, timeout=5)
                                 try:
                                     import socket
@@ -569,6 +599,9 @@ def main():
                             elif cb_data == "copy_domain":
                                 session.post(f"https://api.telegram.org/bot{API_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id}, timeout=5)
                                 send_telegram_message(f"`gcp-hk-1001.cicy.de5.net`", parse_mode="Markdown")
+                            elif cb_data == "menu_gcloud":
+                                session.post(f"https://api.telegram.org/bot{API_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id}, timeout=5)
+                                handle_bot_command("/gcloud")
                             elif cb_data.startswith("menu_"):
                                 menu = cb_data[5:]
                                 session.post(f"https://api.telegram.org/bot{API_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id}, timeout=5)
