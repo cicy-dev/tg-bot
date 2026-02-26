@@ -33,6 +33,9 @@ MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "tts_bot")
 
 TMUX_SOCKET = os.getenv("TMUX_SOCKET", "/home/w3c_offical/.tmux/default")
 
+TTYD_BASE_URL = os.getenv("TTYD_BASE_URL", "https://ttyd-proxy.cicy.de5.net/ttyd")
+TTYD_TOKEN = os.getenv("TTYD_TOKEN", "")
+FASTAPI_URL = os.getenv("FASTAPI_URL", "http://localhost:14444")
 LLM_PROXY_HOST = os.getenv("LLM_PROXY_HOST", "127.0.0.1")
 LLM_PROXY_PORT = os.getenv("LLM_PROXY_PORT", "18080")
 LLM_PROXY_ENABLED = False
@@ -75,7 +78,7 @@ def load_config():
     try:
         with conn.cursor() as c:
             c.execute("""
-                SELECT tg_token, tg_chat_id, proxy, tg_enable, private_mode, allowed_users, llm_proxy
+                SELECT tg_token, tg_chat_id, proxy, tg_enable, private_mode, allowed_users, proxy_enable
                 FROM ttyd_config
                 WHERE pane_id = %s
             """, (PANE_ID,))
@@ -95,7 +98,7 @@ def load_config():
             PRIVATE_MODE = bool(row.get('private_mode'))
             raw_users = row.get('allowed_users') or ''
             ALLOWED_USERS = [u.strip() for u in raw_users.split(',') if u.strip()]
-            LLM_PROXY_ENABLED = bool(row.get('llm_proxy'))
+            LLM_PROXY_ENABLED = bool(row.get('proxy_enable'))
             
             if not API_TOKEN:
                 print(f"Error: tg_token not configured")
@@ -114,7 +117,7 @@ def set_proxy():
         os.environ['ALL_PROXY'] = PROXY
 
 
-def set_llm_proxy():
+def set_proxy_enable():
     """Apply LLM proxy environment variables if enabled.
     Note: Telegram API uses direct connection, proxy is for Agent processes in tmux."""
     global session
@@ -241,7 +244,162 @@ def send_to_tmux(text: str, send_enter: bool = False):
     return True
 
 
-FASTAPI_BASE = "http://localhost:14444"
+FASTAPI_BASE = FASTAPI_URL
+
+# --- 消息队列 & 状态检查 ---
+import threading
+
+msg_queue = []  # 待发送的普通消息队列
+queue_lock = threading.Lock()
+queue_event = threading.Event()
+
+def check_pane_status_full() -> dict:
+    """检查 pane 完整状态"""
+    try:
+        token = load_api_token()
+        pane_base = PANE_ID.split(":")[0] if ":" in PANE_ID else PANE_ID
+        resp = requests.get(
+            f"{FASTAPI_BASE}/api/tmux/pane/agent/status/{pane_base}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception as e:
+        print(f"[Queue] Status check error: {e}")
+    return {"status": "unknown"}
+
+def check_pane_status() -> str:
+    return check_pane_status_full().get("status", "unknown")
+
+def queue_worker():
+    """后台线程：等待 pane idle 后合并发送队列中的消息"""
+    while True:
+        queue_event.wait()
+        queue_event.clear()
+        while True:
+            with queue_lock:
+                if not msg_queue:
+                    break
+            # 检查状态
+            status = check_pane_status()
+            if status in ("thinking", "compacting"):
+                print(f"[Queue] Pane busy ({status}), waiting 3s... ({len(msg_queue)} queued)")
+                time.sleep(3)
+                continue
+            # idle 或其他状态，合并发送
+            with queue_lock:
+                msgs = list(msg_queue)
+                msg_queue.clear()
+            if msgs:
+                merged = "\n".join(msgs)
+                print(f"[Queue] Sending {len(msgs)} merged messages")
+                ensure_pane_alive()
+                send_to_tmux(merged, send_enter=True)
+                
+                threading.Thread(target=wait_and_capture, daemon=True).start()
+            break
+
+_queue_thread = threading.Thread(target=queue_worker, daemon=True)
+_queue_thread_started = False
+
+def extract_last_reply(output: str) -> str:
+    """提取 kiro agent 最后一次回复：在 Credits 行之前、prompt 行之后的 > 开头内容"""
+    lines = output.split("\n")
+    # 找最后一个 Credits 行（回复结束标记）
+    credits_idx = -1
+    for i in range(len(lines) - 1, -1, -1):
+        if "▸ Credits:" in lines[i]:
+            credits_idx = i
+            break
+    if credits_idx < 0:
+        return ""
+    # 往上找 prompt 行（% !>）
+    prompt_idx = -1
+    for i in range(credits_idx - 1, -1, -1):
+        if "% !>" in lines[i] or "% >" in lines[i]:
+            prompt_idx = i
+            break
+    # 提取 prompt 和 credits 之间的内容
+    start = prompt_idx + 1 if prompt_idx >= 0 else 0
+    reply_lines = lines[start:credits_idx]
+    # 清理：去掉空行、thinking、工具调用行
+    clean = []
+    for l in reply_lines:
+        s = l.strip()
+        if not s:
+            continue
+        if "Thinking.." in s:
+            continue
+        if s.startswith("I will run"):
+            continue
+        if "(using tool:" in s:
+            continue
+        if " - Completed in " in s:
+            continue
+        # 去掉 > 前缀
+        if s.startswith("> "):
+            s = s[2:]
+        clean.append(s)
+    return "\n".join(clean)
+
+def wait_and_capture():
+    """后台等待 agent 回复完成，用 Completed 切割提取回复"""
+    try:
+        # 等 agent 开始 thinking（最多 5 秒）
+        for _ in range(5):
+            time.sleep(1)
+            s = check_pane_status()
+            if s in ("thinking", "compacting"):
+                break
+        # 等 agent 回到 idle（最多 300 秒）
+        for _ in range(100):
+            time.sleep(3)
+            s = check_pane_status()
+            if s not in ("thinking", "compacting"):
+                break
+        # capture 并提取回复
+        time.sleep(1)
+        h = fastapi_headers()
+        r = requests.post(f"{FASTAPI_BASE}/api/tmux/capture_pane", json={"pane_id": PANE_ID, "start": -80}, headers=h, timeout=10)
+        output = r.json().get("output", "").strip()
+        if output:
+            reply = extract_last_reply(output)
+            if reply and len(reply) <= 500:
+                send_telegram_message(f"📟 {reply}")
+                if TTS_REPLY and len(reply) <= 200:
+                    send_tts_voice(reply)
+            elif reply:
+                print(f"[Capture] Skipped long reply ({len(reply)} chars)")
+    except Exception as e:
+        print(f"[Capture] Error: {e}")
+
+def enqueue_message(text: str):
+    """将消息加入队列，如果 pane idle 则直接发送"""
+    global _queue_thread_started
+    if not _queue_thread_started:
+        _queue_thread.start()
+        _queue_thread_started = True
+    status = check_pane_status()
+    if status in ("thinking", "compacting"):
+        with queue_lock:
+            msg_queue.append(text)
+        send_telegram_message(f"⏳ Queued ({len(msg_queue)}) — pane is {status}")
+        queue_event.set()
+    else:
+        # idle，直接发送（但先检查队列里有没有积压的）
+        with queue_lock:
+            if msg_queue:
+                msg_queue.append(text)
+                msgs = list(msg_queue)
+                msg_queue.clear()
+            else:
+                msgs = [text]
+        merged = "\n".join(msgs)
+        ensure_pane_alive()
+        send_to_tmux(merged, send_enter=True)
+        
+        threading.Thread(target=wait_and_capture, daemon=True).start()
 
 
 def load_api_token() -> str:
@@ -396,17 +554,37 @@ def handle_bot_command(text: str) -> str | None:
             }, timeout=10)
             return ""
 
+        if cmd == "/kiro":
+            info = check_pane_status_full()
+            status = info.get("status", "unknown")
+            ctx = info.get("contextUsage")
+            status_emoji = {"idle": "🟢", "thinking": "🟡", "compacting": "🔵", "wait_auth": "🔴", "wait_startup": "⚪"}.get(status, "⚫")
+            lines = [f"🤖 Kiro Agent Status", f"{status_emoji} Status: {status}"]
+            if ctx is not None:
+                lines.append(f"📊 Context: {ctx}%")
+            with queue_lock:
+                q = len(msg_queue)
+                q_preview = list(msg_queue)
+            lines.append(f"📬 Queue: {q} msgs")
+            if q_preview:
+                for i, m in enumerate(q_preview[:5], 1):
+                    lines.append(f"  {i}. {m[:60]}")
+                if len(q_preview) > 5:
+                    lines.append(f"  ... +{len(q_preview)-5} more")
+            buttons = [
+                [{"text": "🗜 /compact", "callback_data": "kiro_compact"}, {"text": "🔄 /model", "callback_data": "kiro_model"}],
+                [{"text": "🗑 Clear Queue", "callback_data": "kiro_clear"}, {"text": "🔃 Refresh", "callback_data": "kiro_refresh"}],
+            ]
+            session.post(f"https://api.telegram.org/bot{API_TOKEN}/sendMessage", json={
+                "chat_id": TG_CHAT_ID,
+                "text": "\n".join(lines),
+                "reply_markup": {"inline_keyboard": buttons},
+            }, timeout=10)
+            return ""
+
         if cmd == "/admin":
-            ttyd_url = ""
-            try:
-                conn = get_db()
-                with conn.cursor() as c:
-                    c.execute("SELECT url FROM ttyd_config WHERE pane_id = %s", (PANE_ID,))
-                    row = c.fetchone()
-                    ttyd_url = row.get("url", "") if row else ""
-                conn.close()
-            except Exception:
-                pass
+            pane_base = PANE_ID.split(":")[0] if ":" in PANE_ID else PANE_ID
+            ttyd_url = f"{TTYD_BASE_URL}/{pane_base}/?token={TTYD_TOKEN}" if TTYD_TOKEN else f"{TTYD_BASE_URL}/{pane_base}/"
             # Get public IP and domain
             try:
                 pub_ip = requests.get("https://ifconfig.me", timeout=5).text.strip()
@@ -427,7 +605,7 @@ def handle_bot_command(text: str) -> str | None:
                 f"🏷 Domain: {domain}",
                 f"🔗 {domain_status}",
                 f"🔗 proxy: {PROXY or 'none'}",
-                f"🔀 llm_proxy: {'on' if LLM_PROXY_ENABLED else 'off'}",
+                f"🔀 proxy_enable: {'on' if LLM_PROXY_ENABLED else 'off'}",
             ]
             if ttyd_url:
                 lines.append(f"\n🖥 Terminal:\n{ttyd_url}")
@@ -523,7 +701,7 @@ def main():
     
     load_config()
     set_proxy()
-    set_llm_proxy()
+    set_proxy_enable()
     
     print(f"[PROXY] Routing via {LLM_PROXY_HOST}:{LLM_PROXY_PORT} with Pane-ID: {PANE_ID}")
     print(f"Bot started for pane {PANE_ID}, waiting for messages...")
@@ -641,18 +819,31 @@ def main():
                                 try:
                                     conn = get_db()
                                     with conn.cursor() as c:
-                                        c.execute("SELECT url, title FROM ttyd_config WHERE pane_id = %s", (pane,))
+                                        c.execute("SELECT title FROM ttyd_config WHERE pane_id = %s", (pane,))
                                         row = c.fetchone()
                                     conn.close()
-                                    url = row.get("url", "") if row else ""
                                     title = row.get("title", pane) if row else pane
-                                    if url:
-                                        send_telegram_message(f"🖥 {title}\n{url}")
-                                    else:
-                                        send_telegram_message(f"📟 {pane} (no URL)")
-                                except:
-                                    send_telegram_message(f"📟 {pane}")
+                                    pane_base = pane.split(":")[0] if ":" in pane else pane
+                                    ttyd_url = f"{TTYD_BASE_URL}/{pane_base}/?token={TTYD_TOKEN}" if TTYD_TOKEN else f"{TTYD_BASE_URL}/{pane_base}/"
+                                    send_telegram_message(f"🖥 {title}\n{ttyd_url}")
+                                except Exception as e:
+                                    send_telegram_message(f"📟 {pane}: {e}")
                                 session.post(f"https://api.telegram.org/bot{API_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id}, timeout=5)
+                            elif cb_data == "kiro_compact":
+                                session.post(f"https://api.telegram.org/bot{API_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": "⏳ Queuing /compact..."}, timeout=5)
+                                enqueue_message("/compact")
+                            elif cb_data == "kiro_model":
+                                session.post(f"https://api.telegram.org/bot{API_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": "⏳ Queuing /model..."}, timeout=5)
+                                enqueue_message("/model")
+                            elif cb_data == "kiro_clear":
+                                with queue_lock:
+                                    cleared = len(msg_queue)
+                                    msg_queue.clear()
+                                session.post(f"https://api.telegram.org/bot{API_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": f"🗑 Cleared {cleared} msgs"}, timeout=5)
+                                handle_bot_command("/kiro")
+                            elif cb_data == "kiro_refresh":
+                                session.post(f"https://api.telegram.org/bot{API_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": "🔃 Refreshing..."}, timeout=5)
+                                handle_bot_command("/kiro")
                             elif cb_data.startswith("kb_"):
                                 KB_MAP = {
                                     "kb_y": "y", "kb_n": "n", "kb_t": "t", "kb_enter": "Enter", "kb_space": " ",
@@ -751,26 +942,8 @@ def main():
                         cmd = text
                     
                     print(f"Sending: {cmd}")
-                    ensure_pane_alive()
-                    send_to_tmux(cmd, send_enter=True)
-                    send_telegram_message(f"🚀 {PANE_ID}")
-                    if TTS_REPLY:
-                        time.sleep(8)
-                        try:
-                            h = fastapi_headers()
-                            r = requests.post(f"{FASTAPI_BASE}/api/tmux/capture_pane", json={"pane_id": PANE_ID, "start": -5}, headers=h, timeout=10)
-                            output = r.json().get("output", "").strip()
-                            if output:
-                                lines = [l for l in output.split("\n") if l.strip() and not l.strip().startswith(("λ >", "> ", "55%", "Credits:")) and cmd not in l]
-                                trimmed = "\n".join(lines[-3:]) if lines else ""
-                                if trimmed:
-                                    if len(trimmed) > 500:
-                                        trimmed = trimmed[-500:]
-                                    send_telegram_message(f"📟 {trimmed}")
-                                    if len(trimmed) <= 20:
-                                        send_tts_voice(trimmed)
-                        except Exception as e:
-                            print(f"Capture failed: {e}")
+                    enqueue_message(cmd)
+
                 except Exception as e:
                     print(f"Message handling error: {e}")
                     try:
